@@ -193,13 +193,79 @@ async def command_help(message: Message) -> None:
     )
 
 
+async def send_manager_cancellation_notice(bot: Bot, user_id: int, app: dict) -> bool:
+    """Notify the manager that an already submitted application was cancelled."""
+    if not settings.manager_chat_id:
+        logger.warning("Cannot notify manager about cancellation: MANAGER_CHAT_ID is empty")
+        return False
+
+    application_number = app.get("application_number")
+    number_text = f"№{application_number}" if application_number is not None else "без номера"
+    username = f"@{app['username']}" if app.get("username") else "не указан"
+    manager_text = (
+        f"⚠️ <b>Клиент отменил заявку {number_text}</b>\n\n"
+        f"<b>Имя:</b> {escape(str(app.get('client_name') or '—'))}\n"
+        f"<b>Телефон:</b> {escape(str(app.get('phone') or '—'))}\n"
+        f"<b>Telegram:</b> {escape(username)}\n"
+        f"<b>User ID:</b> <code>{user_id}</code>\n\n"
+        "Заявка сохранена в базе со статусом «cancelled»."
+    )
+    try:
+        await bot.send_message(int(settings.manager_chat_id), manager_text)
+    except (ValueError, TelegramAPIError):
+        logger.exception("Could not notify manager about cancelled application user_id=%s", user_id)
+        return False
+
+    db.mark_cancellation_notified(user_id)
+    return True
+
+
+async def cancel_current_application(message: Message) -> None:
+    user_id = message.from_user.id
+    result = db.cancel_application(user_id)
+
+    if not result or not result.get("found"):
+        await message.answer(
+            "Активная заявка не найдена. Чтобы начать оформление, нажмите кнопку ниже.",
+            reply_markup=start_keyboard(),
+        )
+        return
+
+    app = db.get_application(user_id) or {}
+    notification_sent = False
+    notification_needed = bool(result.get("notify_manager"))
+    if notification_needed:
+        notification_sent = await send_manager_cancellation_notice(message.bot, user_id, app)
+
+    if result.get("changed"):
+        if result.get("previous_status") == "submitted":
+            number = app.get("application_number")
+            number_text = f" №{number}" if number is not None else ""
+            if notification_sent:
+                response = f"Заявка{number_text} отменена. Менеджер уведомлён."
+            else:
+                response = (
+                    f"Заявка{number_text} помечена как отменённая, но уведомить менеджера "
+                    "автоматически не удалось. Пожалуйста, напишите ему напрямую."
+                )
+        else:
+            response = "Черновик заявки отменён. Чтобы начать заново, нажмите кнопку ниже."
+    else:
+        response = "Эта заявка уже была отменена. Повторная отмена не требуется."
+        if notification_sent:
+            response += " Менеджер дополнительно уведомлён."
+
+    await message.answer(response, reply_markup=start_keyboard())
+    if notification_needed and not notification_sent and settings.manager_username:
+        await message.answer(
+            "Связаться с менеджером можно здесь:",
+            reply_markup=manager_contact_keyboard(settings.manager_username),
+        )
+
+
 @dp.message(Command("cancel"))
 async def command_cancel(message: Message) -> None:
-    db.cancel_application(message.from_user.id)
-    await message.answer(
-        "Заявка отменена. Чтобы заполнить новую, нажмите кнопку ниже.",
-        reply_markup=start_keyboard(),
-    )
+    await cancel_current_application(message)
 
 
 @dp.callback_query(F.data == "resume_application")
@@ -240,11 +306,13 @@ async def handle_text(message: Message) -> None:
     step = app["step"]
 
     if text == CANCEL:
-        db.cancel_application(user_id)
-        await message.answer("Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", reply_markup=start_keyboard())
+        await cancel_current_application(message)
         return
 
     if text == START_TOUR:
+        if app["status"] in {"submitted", "cancelled"}:
+            await start_new_application(message)
+            return
         if app["status"] == "draft" and step not in {"new", "consent"}:
             await message.answer("У вас уже есть незавершённая заявка. Продолжить её или начать заново?", reply_markup=resume_or_new_keyboard())
             return
@@ -423,7 +491,13 @@ async def submit_application(message: Message) -> None:
     if app.get("status") == "submitted":
         number = app.get("application_number")
         number_text = f" №{number}" if number is not None else ""
-        await message.answer(f"Эта заявка уже отправлена менеджеру{number_text}.")
+        await message.answer(f"Эта заявка уже отправлена менеджеру{number_text}.", reply_markup=start_keyboard())
+        return
+    if app.get("status") != "draft" or app.get("step") != "confirm":
+        await message.answer(
+            "Эта заявка уже неактивна. Нажмите «Подобрать тур», чтобы оформить новую.",
+            reply_markup=start_keyboard(),
+        )
         return
 
     # The number is persisted before sending, so a failed delivery retry keeps the same number.
@@ -461,11 +535,27 @@ async def submit_application(message: Message) -> None:
         )
         return
 
-    db.mark_submitted(user_id)
+    marked_submitted = db.mark_submitted(user_id)
+    if not marked_submitted:
+        current_app = db.get_application(user_id)
+        if current_app and current_app.get("status") == "cancelled":
+            # The manager received the application, but the user cancelled during delivery.
+            await send_manager_cancellation_notice(message.bot, user_id, current_app)
+            await message.answer(
+                "Заявка была отменена. Менеджер уведомлён об отмене.",
+                reply_markup=start_keyboard(),
+            )
+            return
+
     await message.answer(
         f"✅ <b>Заявка №{application_number} отправлена!</b>\nМенеджер получил ваши пожелания и скоро свяжется с вами 🌴",
-        reply_markup=manager_contact_keyboard(settings.manager_username) if settings.manager_username else None,
+        reply_markup=start_keyboard(),
     )
+    if settings.manager_username:
+        await message.answer(
+            "При необходимости вы можете написать менеджеру напрямую:",
+            reply_markup=manager_contact_keyboard(settings.manager_username),
+        )
 
 
 async def reminder_worker(bot: Bot) -> None:

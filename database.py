@@ -1,7 +1,5 @@
-import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from config import settings
@@ -26,6 +24,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    """Create the database and add new columns without deleting existing data."""
     with _connect() as conn:
         conn.execute(
             """
@@ -50,10 +49,20 @@ def init_db() -> None:
             )
             """
         )
-        # Migrate databases created before application numbering was added.
+
+        # Migrations are additive: the existing applications and sequence are preserved.
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(applications)")}
-        if "application_number" not in columns:
-            conn.execute("ALTER TABLE applications ADD COLUMN application_number INTEGER")
+        migrations = {
+            "application_number": "ALTER TABLE applications ADD COLUMN application_number INTEGER",
+            "cancelled_from": "ALTER TABLE applications ADD COLUMN cancelled_from TEXT",
+            "cancellation_notified": (
+                "ALTER TABLE applications ADD COLUMN cancellation_notified INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                conn.execute(sql)
+
         conn.execute(
             """CREATE TABLE IF NOT EXISTS application_sequence (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -62,6 +71,14 @@ def init_db() -> None:
         )
         conn.execute(
             "INSERT OR IGNORE INTO application_sequence (id, next_number) VALUES (1, 1)"
+        )
+        # Ensure the sequence cannot reuse a number already present in the database.
+        max_number = conn.execute(
+            "SELECT COALESCE(MAX(application_number), 0) FROM applications"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE application_sequence SET next_number = MAX(next_number, ?) WHERE id = 1",
+            (int(max_number) + 1,),
         )
         conn.commit()
 
@@ -97,6 +114,7 @@ def create_or_reset_application(
                     destination = NULL, vacation_type = NULL, travel_dates = NULL,
                     tourists = NULL, budget = NULL, client_name = NULL, phone = NULL,
                     status = 'draft', application_number = NULL,
+                    cancelled_from = NULL, cancellation_notified = 0,
                     reminder_sent = 0, created_at = ?, updated_at = ?
                     WHERE user_id = ?""",
                 (username, first_name, now, now, user_id),
@@ -129,8 +147,71 @@ def update_application(user_id: int, **fields: Any) -> None:
         conn.commit()
 
 
-def cancel_application(user_id: int) -> None:
-    update_application(user_id, status="cancelled", step="cancelled", reminder_sent=1)
+def cancel_application(user_id: int) -> dict[str, Any]:
+    """Cancel once and report whether a manager notification is required.
+
+    A previously submitted application is not deleted. Its status becomes
+    'cancelled', and the caller is responsible for notifying the manager.
+    Repeated calls do not create duplicate notifications after confirmation.
+    """
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT status, cancelled_from, cancellation_notified
+               FROM applications WHERE user_id = ?""",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return {"found": False, "changed": False, "notify_manager": False}
+
+        current_status = str(row["status"])
+        if current_status == "cancelled":
+            previous_status = row["cancelled_from"] or "cancelled"
+            should_notify = previous_status == "submitted" and not bool(row["cancellation_notified"])
+            conn.commit()
+            return {
+                "found": True,
+                "changed": False,
+                "previous_status": previous_status,
+                "notify_manager": should_notify,
+            }
+
+        if current_status not in {"draft", "submitted"}:
+            conn.commit()
+            return {
+                "found": True,
+                "changed": False,
+                "previous_status": current_status,
+                "notify_manager": False,
+            }
+
+        conn.execute(
+            """UPDATE applications
+               SET status = 'cancelled', step = 'cancelled', reminder_sent = 1,
+                   cancelled_from = ?, cancellation_notified = 0, updated_at = ?
+               WHERE user_id = ? AND status = ?""",
+            (current_status, utc_now(), user_id, current_status),
+        )
+        conn.commit()
+        return {
+            "found": True,
+            "changed": True,
+            "previous_status": current_status,
+            "notify_manager": current_status == "submitted",
+        }
+
+
+def mark_cancellation_notified(user_id: int) -> bool:
+    """Record that Telegram accepted the cancellation notice for the manager."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE applications SET cancellation_notified = 1, updated_at = ?
+               WHERE user_id = ? AND status = 'cancelled'""",
+            (utc_now(), user_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def assign_application_number(user_id: int) -> int:
@@ -162,8 +243,17 @@ def assign_application_number(user_id: int) -> int:
         return number
 
 
-def mark_submitted(user_id: int) -> None:
-    update_application(user_id, status="submitted", step="submitted", reminder_sent=1)
+def mark_submitted(user_id: int) -> bool:
+    """Mark as submitted only if the user has not cancelled meanwhile."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE applications
+               SET status = 'submitted', step = 'submitted', reminder_sent = 1, updated_at = ?
+               WHERE user_id = ? AND status = 'draft'""",
+            (utc_now(), user_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def mark_reminder_sent(user_id: int) -> None:
